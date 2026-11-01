@@ -1,19 +1,53 @@
 /**
- * Pi-vcc compile entry — orchestrates normalization → noise filtering → section building.
+ * Pi-vcc compile entry — orchestrates normalization → noise filtering →
+ * ranked brief selection → section building → merge-with-previous.
  *
  * Upstream: https://github.com/sting8k/pi-vcc (src/core/summarize.ts)
+ * merged at the 0.11.0 section redesign:
+ * - Sections are [Early Session Requests] / [Files And Changes] / [Commits] /
+ *   [Tracked Commands] / [User Messages] — verbatim user text picked by
+ *   position, no English keyword interpretation. pi-blackhole's [User
+ *   Decisions] is kept. The removed [Session Goal] / [User Preferences] /
+ *   [Outstanding Context] are migrated: a previous summary's first real
+ *   [Session Goal] line becomes the early requests; the rest is dropped.
+ * - Header extraction is shape-based (a "[Title Case]" line standing alone in
+ *   the head area), not a name-list regex scan, so transcript text that
+ *   mentions a header name can no longer merge in as junk (upstream #60).
+ * - The brief transcript uses upstream's signal-density ranking under a
+ *   size-relative character budget (core/rank.ts) instead of a fixed cap.
+ *
  * Modified by pi-blackhole:
- * - threads touchMessages/cwd into buildSections for file-touch attribution
- *   (src/extract/file-touch.ts); merge logic otherwise unchanged.
+ * - threads touchMessages/cwd/gitTags into buildSections for file-touch
+ *   attribution (src/extract/file-touch.ts) and richer Files And Changes.
+ * - OM coupling: stripOMContent / extractRecallNote around the merge; recall
+ *   notes stripped with paragraph matching before merging.
+ * - mergeFileLines: multi-line Files And Changes parse with git-tag handling
+ *   — the canonical Files merger; it parses both the blackhole multi-line
+ *   render and the upstream single-line shape, so summaries written by any
+ *   version merge correctly.
  */
 import type { Message } from "@earendil-works/pi-ai";
-import type { FileOps } from "../types";
+import type { FileOps, NormalizedBlock } from "../types";
 import { normalize } from "./normalize";
 import { filterNoise } from "./filter-noise";
 import { buildSections } from "./build-sections";
 import { formatFileList } from "../extract/files";
 import { MAX_DECISIONS } from "../extract/user-decisions";
-import { formatSummary, capBrief, RECALL_NOTE, wrapLongLines } from "./format";
+import {
+  keepNewestUserMessages,
+  EARLY_REQUESTS_KEPT,
+} from "../extract/user-messages";
+import { COMMAND_SEPARATOR, COMMANDS_PER_NAME } from "../extract/tracked-commands";
+import { selectRankedBriefBlocks, type BriefRankingOptions } from "./rank";
+import {
+  formatSummary,
+  capBrief,
+  capItems,
+  stripCapMarker,
+  BRIEF_MAX_LINES,
+  RECALL_NOTE,
+  wrapLongLines,
+} from "./format";
 
 export interface CompileInput {
   messages: Message[];
@@ -35,138 +69,264 @@ export interface CompileInput {
    * renders as no ref (fail-closed). Omitted entirely → legacy positional.
    */
   sourceIndices?: Array<number | undefined>;
+  /** Command names to record in a [Tracked Commands] section; empty/omitted
+   * = section stays empty. Threaded from config.trackCommands by the hook. */
+  trackCommands?: readonly string[];
 }
 
+export interface RankedCompileInput extends CompileInput {
+  /** Brief budget, char-denominated. The hook derives these from the
+   * session's calibrated charsPerToken (core/token-estimate.ts), exactly as
+   * upstream pi-vcc does; see RANKED_BRIEF_* in hooks/before-compact.ts. */
+  ranking?: BriefRankingOptions;
+}
+
+const EARLY = "Early Session Requests";
 const HEADER_NAMES = [
-  "Session Goal",
+  EARLY,
   "Files And Changes",
   "Commits",
-  "Outstanding Context",
-  "User Preferences",
+  "Tracked Commands",
+  "User Messages",
   "User Decisions",
 ];
 
 const SEPARATOR = "\n\n---\n\n";
 
-/**
- * Join wrapped continuation lines back into their bullet item.
- *
- * formatSummary() wraps long lines at 120 chars with a space continuation
- * indent; both the fresh output and stored previous summaries reach the merge
- * below in that wrapped form. A wrapped "- Modified: a,\n  b,\n  c" bullet
- * spans several physical lines of which only the first starts with the
- * "- <Category>: " prefix — without rejoining, the merge silently keeps only
- * the entries on the first line and drops the rest.
- * Continuation lines start with spaces while bullets, headers and blank
- * separator lines never do, so joining "\n + non-space" with a single space
- * only ever rejoins wrapped content.
- */
-const joinWrappedLines = (text: string): string => text.replace(/\n +(?=\S)/g, " ");
+// ── Shape-based header extraction ─────────────────────────────────────────
+// A header is a "[Title Case]" line standing alone in the head area (the text
+// before the first separator) plus the lines up to the next blank line. The
+// brief transcript's blocks are "[user]" / "[assistant]", and a transcript
+// line can start with "[Some Title]" followed by more text, so a header is
+// never found by searching the text for "[Title]". (Upstream #60.)
+const HEADER_LINE_RE = /^\[[A-Z][^\]\n]*\]$/;
 
-/** Extract a named section from summary text.
- *
- * The header must start at a line boundary — inline mentions such as
- * "`[Files And Changes]`" inside a hand-written pi-native summary must not
- * match, otherwise the "previous section" becomes a giant blob from the
- * mention to the end of the text and the merge drops almost everything.
- */
-const sectionOf = (text: string, header: string): string => {
-  // Escape the header name for regex safety
-  const openEscaped = header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const open = text.match(new RegExp(`(?:^|\\n)\\[${openEscaped}\\]`));
-  if (!open || open.index === undefined) return "";
-  const start = open.index + (open[0].startsWith("\n") ? 1 : 0);
-  const after = joinWrappedLines(text.slice(start));
-  // Find next section header (must start at line boundary to avoid matching in content)
-  const nextSection = HEADER_NAMES.filter((h) => h !== header)
-    .map((h) => {
-      // Escape the header name for regex safety
-      const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(`(?:^|\\n)\\[${escaped}\\]`);
-      const m = after.match(re);
-      if (!m) return -1;
-      // m.index points to \n (or 0); advance past it to the [
-      return m.index! + (m[0].startsWith("\n") ? 1 : 0);
-    })
-    .filter((n) => n >= 0);
-  const nextSep = after.indexOf("\n\n---\n\n");
-  const candidates = [...nextSection, ...(nextSep > 0 ? [nextSep] : [])].sort((a, b) => a - b);
-  const end = candidates[0];
-  return (end ? after.slice(0, end) : after).trim();
-};
-
-/** Extract a header section WITHOUT rejoining continuation lines — preserves
- *  multi-line list format for Files And Changes merge. */
-export const extractSection = (text: string, header: string): string => {
-  const openEscaped = header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const open = text.match(new RegExp(`(?:^|\\n)\\[${openEscaped}\\]`));
-  if (!open || open.index === undefined) return "";
-  // Start after the header line (skip "[Header]\n")
-  // open.index points to the start of the match (either 0 or at a \n).
-  // The header line ends at the first \n after the closing ].
-  const headerStart = open.index + (open[0].startsWith("\n") ? 1 : 0); // position of [
-  const headerEnd = text.indexOf("\n", headerStart); // \n after ]
-  const start = headerEnd >= 0 ? headerEnd + 1 : text.length;
-  const after = text.slice(start); // NO joinWrappedLines
-  const nextSection = HEADER_NAMES.filter((h) => h !== header)
-    .map((h) => {
-      const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(`(?:^|\\n)\\[${escaped}\\]`);
-      const m = after.match(re);
-      if (!m) return -1;
-      return m.index! + (m[0].startsWith("\n") ? 1 : 0);
-    })
-    .filter((n) => n >= 0);
-  const nextSep = after.indexOf(SEPARATOR);
-  const candidates = [...nextSection, ...(nextSep > 0 ? [nextSep] : [])].sort((a, b) => a - b);
-  const end = candidates[0];
-  return (end ? after.slice(0, end) : after).trim();
-};
-
-/** Extract the brief transcript part (everything after ---) */
-const briefOf = (text: string): string => {
+const splitSummary = (text: string): { head: string; brief: string } => {
+  if (!HEADER_LINE_RE.test(text.split("\n", 1)[0])) return { head: "", brief: text.trim() };
   const idx = text.indexOf(SEPARATOR);
-  if (idx < 0) return "";
-  return text.slice(idx + SEPARATOR.length).trim();
+  if (idx < 0) return { head: text, brief: "" };
+  return { head: text.slice(0, idx), brief: text.slice(idx + SEPARATOR.length).trim() };
 };
 
-/** Merge a header section */
-const mergeHeaderSection = (header: string, prev: string, fresh: string): string => {
-  // Outstanding Context is volatile -- always use fresh only
-  if (header === "Outstanding Context") return fresh;
-  if (!prev) return fresh;
-  if (!fresh) return prev;
+/** Extract a named section from summary text (head area only). */
+export const sectionOf = (text: string, header: string): string => {
+  const lines = splitSummary(text).head.split("\n");
+  const start = lines.indexOf(`[${header}]`);
+  if (start < 0) return "";
+  let end = start + 1;
+  while (end < lines.length && lines[end].trim() !== "") end++;
+  return lines.slice(start, end).join("\n").trim();
+};
 
-  // Files And Changes: merge by category (Modified/Created/Read), dedup paths
-  if (header === "Files And Changes") {
-    return mergeFileLines(extractSection(prev, header), extractSection(fresh, header));
+export const briefOf = (text: string): string => splitSummary(text).brief;
+
+const isClean = (l: string) => l.startsWith("- ") && !l.includes("<skill") && !l.includes("</skill");
+
+// Both summaries went through wrapLongLines (the fresh one in formatSummary);
+// rejoin each item's indented continuation lines so the merges, which read
+// only "- " lines, see whole items.
+const unwrapSection = (text: string, header: string) =>
+  sectionOf(text, header).replace(/\n[ \t]+(?=\S)/g, " ");
+
+/**
+ * The previous summary's early requests, kept as they are: the first summary
+ * sets them. An older version's [Session Goal] gives its first real line
+ * (not a "- [skill: x]" / "- [Scope change]" marker).
+ */
+const pinnedEarlyRequests = (prev: string): string[] => {
+  const early = unwrapSection(prev, EARLY).split("\n").filter(isClean);
+  if (early.length > 0) return early.slice(0, EARLY_REQUESTS_KEPT);
+  const goal = unwrapSection(prev, "Session Goal")
+    .split("\n")
+    .find((l) => isClean(l) && !/^- \[[^\]]*\]$/.test(l));
+  return goal ? [goal] : [];
+};
+
+const COMMITS_CAP = 8;
+const COMMIT_HASH_RE = /^- [0-9a-f]{7,12}: /;
+const bareCommit = (line: string): string => line.replace(COMMIT_HASH_RE, "- ");
+
+/** One line per commit, first-seen order. A hashless line is the same commit
+ * as a hashed line with its message (one side did not capture the hash): keep
+ * the hashed one, in the earlier line's place. */
+const dedupCommitLines = (lines: string[]): string[] => {
+  const out: string[] = [];
+  for (const line of lines) {
+    if (out.includes(line)) continue;
+    const bare = bareCommit(line);
+    if (COMMIT_HASH_RE.test(line)) {
+      const hashless = out.findIndex((o) => o === bare);
+      if (hashless >= 0) out[hashless] = line;
+      else out.push(line);
+    } else if (!out.some((o) => bareCommit(o) === bare)) {
+      out.push(line);
+    }
   }
-
-  // Session Goal, User Preferences: line-level dedup, cap
-  const isClean = (l: string) =>
-    l.startsWith("- ") && !l.includes("<skill") && !l.includes("</skill");
-  const prevLines = prev.split("\n").filter(isClean);
-  const freshLines = fresh.split("\n").filter(isClean);
-  const combined = [...new Set([...prevLines, ...freshLines])];
-  const CAP =
-    header === "User Decisions"
-      ? MAX_DECISIONS
-      : header === "Session Goal" || header === "Commits"
-        ? 8
-        : 15;
-  // Session Goal: keep first items so the original first message persists
-  // Other sections: keep last items (fresh overrides stale)
-  const capped =
-    combined.length > CAP
-      ? header === "Session Goal"
-        ? combined.slice(0, CAP)
-        : combined.slice(-CAP)
-      : combined;
-  if (capped.length === 0) return "";
-  return `[${header}]\n${capped.join("\n")}`;
+  return out;
 };
 
-/** Merge Files And Changes by category, dedup paths across compactions. */
+/**
+ * Section mergers. Each merger receives the FULL previous and fresh summary
+ * texts and extracts its own section — one entry point per header, declared
+ * alongside the header list, so a section can never be merged by the wrong
+ * policy (the failure mode this replaced: fall-through to the Commits merge).
+ */
+type SectionMerger = (prevText: string, freshText: string) => string;
+
+const sectionLines = (sectionText: string): string[] =>
+  sectionText.split("\n").filter(isClean);
+
+/** Dedup + newest-cap merger shared by the line-list sections. */
+const lineListMerger = (
+  header: string,
+  dedupeLines: (lines: string[]) => string[],
+  cap: number,
+): SectionMerger =>
+  (prevText, freshText) => {
+    const prevSec = unwrapSection(prevText, header);
+    const freshSec = unwrapSection(freshText, header);
+    if (!prevSec) return freshSec;
+    if (!freshSec) return prevSec;
+    const capped = dedupeLines([
+      ...sectionLines(prevSec),
+      ...sectionLines(freshSec),
+    ]).slice(-cap);
+    return capped.length === 0 ? "" : `[${header}]\n${capped.join("\n")}`;
+  };
+
+/**
+ * Generic categorized-section merge: parses "- Category: a, b, c (+N more)"
+ * lines from both prev and fresh text, unions each category's items across
+ * compactions (deduped via Set), and re-renders. (Upstream.)
+ */
+const mergeCategorizedLines = (
+  categories: readonly string[],
+  prev: string,
+  fresh: string,
+  splitOn: string,
+  touchOnDup = false,
+): Record<string, Set<string>> => {
+  const merged: Record<string, Set<string>> = {};
+  for (const cat of categories) merged[cat] = new Set();
+
+  for (const text of [prev, fresh]) {
+    for (const line of text.split("\n")) {
+      for (const cat of categories) {
+        const prefix = `- ${cat}: `;
+        if (!line.startsWith(prefix)) continue;
+        // Strip the overflow marker so it never merges back in as an entry.
+        const rest = stripCapMarker(line.slice(prefix.length));
+        for (const p of rest.split(splitOn)) {
+          const trimmed = p.trim();
+          if (!trimmed) continue;
+          // touchOnDup: re-inserting an existing entry moves it to the
+          // tail — with tail-capping this makes the section "N most-
+          // recently-USED" rather than "N most-recently-first-seen".
+          if (touchOnDup && merged[cat].has(trimmed)) merged[cat].delete(trimmed);
+          merged[cat].add(trimmed);
+        }
+      }
+    }
+  }
+  return merged;
+};
+
+const formatCategorizedLines = (
+  header: string,
+  merged: Record<string, Set<string>>,
+  categories: readonly string[],
+  joinWith: string,
+  itemLimit: number,
+): string => {
+  const lines: string[] = [];
+  for (const cat of categories) {
+    if (merged[cat].size > 0)
+      lines.push(`- ${cat}: ${capItems([...merged[cat]], itemLimit, joinWith)}`);
+  }
+  if (lines.length === 0) return "";
+  return `[${header}]\n${lines.join("\n")}`;
+};
+
+/** Category names actually present in "- <name>: ..." lines in `text`. */
+const discoverCategoryNames = (text: string): string[] => {
+  const names = new Set<string>();
+  for (const line of text.split("\n")) {
+    const m = line.match(/^- ([^:]+): /);
+    if (m) names.add(m[1]);
+  }
+  return [...names];
+};
+
+/**
+ * Merge Tracked Commands by whatever command names actually appear in prev/
+ * fresh (not a fixed category list, since trackCommands is user-config).
+ * Line format (separator, cap) is owned by extract/tracked-commands.ts.
+ */
+const mergeTrackedCommandLines = (prev: string, fresh: string): string => {
+  const categories = [
+    ...new Set([...discoverCategoryNames(prev), ...discoverCategoryNames(fresh)]),
+  ];
+  const merged = mergeCategorizedLines(
+    categories,
+    prev,
+    fresh,
+    COMMAND_SEPARATOR,
+    true,
+  );
+  return formatCategorizedLines(
+    "Tracked Commands",
+    merged,
+    categories,
+    COMMAND_SEPARATOR,
+    COMMANDS_PER_NAME,
+  );
+};
+
+/**
+ * One merger per header, keyed by the exact HEADER_NAMES list. The loop in
+ * mergePrevious looks each header up here and throws on a missing entry —
+ * a section can never be merged by the wrong policy (the failure mode this
+ * replaced: fall-through to the Commits merge for Early Session Requests).
+ */
+const SECTION_MERGERS: Record<string, SectionMerger> = {
+  // Early requests are set once by the first summary and pinned forever
+  // (including the legacy [Session Goal] migration); the fresh side is
+  // ignored while pinned and used verbatim when nothing is pinned.
+  [EARLY]: (prevText, freshText) => {
+    const pinned = pinnedEarlyRequests(prevText);
+    if (pinned.length > 0) return `[${EARLY}]\n${pinned.join("\n")}`;
+    return unwrapSection(freshText, EARLY);
+  },
+  // Files merge parses its own section text; mergeFileLines understands both
+  // blackhole's multi-line list shape and the upstream single-line shape,
+  // so summaries written by any version merge correctly.
+  "Files And Changes": (prevText, freshText) =>
+    mergeFileLines(
+      sectionOf(prevText, "Files And Changes"),
+      sectionOf(freshText, "Files And Changes"),
+    ),
+  "Tracked Commands": (prevText, freshText) =>
+    mergeTrackedCommandLines(
+      unwrapSection(prevText, "Tracked Commands"),
+      unwrapSection(freshText, "Tracked Commands"),
+    ),
+  "User Messages": (prevText, freshText) => {
+    const prevSec = unwrapSection(prevText, "User Messages");
+    const freshSec = unwrapSection(freshText, "User Messages");
+    if (!prevSec) return freshSec;
+    if (!freshSec) return prevSec;
+    return `[User Messages]\n${keepNewestUserMessages([
+      ...sectionLines(prevSec),
+      ...sectionLines(freshSec),
+    ]).join("\n")}`;
+  },
+  Commits: lineListMerger("Commits", dedupCommitLines, COMMITS_CAP),
+  "User Decisions": lineListMerger(
+    "User Decisions",
+    (lines) => [...new Set(lines)],
+    MAX_DECISIONS,
+  ),
+};
 
 /**
  * Git word-tag suffix appended by the fresh compile ("src/a.ts (staged)").
@@ -176,15 +336,6 @@ const mergeHeaderSection = (header: string, prev: string, fresh: string): string
 const GIT_TAG_SUFFIX_RE =
   /\s+\((?:staged|unstaged|new|renamed|deleted|conflicted|staged,unstaged)\)\s*$/;
 
-/**
- * Add one header-rest or continuation line to the merged map, splitting on
- * top-level commas — a git word tag can contain one ("a.ts
- * (staged,unstaged)"); splitting inside the parens yields partial keys
- * ("a.ts (staged", "unstaged)") that defeat the prev/fresh dedup and
- * duplicate the file on re-touch. New-shape list lines hold a single
- * (comma-terminated) path, so the split is a no-op for them — including
- * after wrapLineWithContinuation fragments are reassembled by mergeFileLines.
- */
 const addEntries = (
   merged: Record<string, Map<string, string>>,
   cat: string,
@@ -200,8 +351,6 @@ const addEntries = (
     const key = trimmed.replace(GIT_TAG_SUFFIX_RE, "");
     const map = merged[cat];
     if (!map.has(key)) {
-      // Fresh entries keep their tags; prev-only entries store the
-      // stripped key — prev tags are stale point-in-time state.
       map.set(key, isFresh ? trimmed : key);
     }
   }
@@ -220,17 +369,6 @@ const endsWithTopLevelComma = (s: string): boolean => {
   return lastComma >= 0 && s.slice(lastComma + 1).trim().length === 0;
 };
 
-/**
- * Append the next physical line to the pending fragment.
- *
- * A line that was hard-broken mid-token (overlong single-token path —
- * wrapTextWithAnsi splits without consuming a space) must be joined with NO
- * space, or the reconstructed path is corrupted. A space-broken continuation
- * (word wrap between entries/tags, e.g. a `(+N more)` tail) needs the space
- * back. A fragment without whitespace is a mid-token tail; a partial `(+N`
- * suffix is a space-broken token — joined with a space so the more-suffix
- * regex still matches.
- */
 const appendFragment = (fragment: string, next: string): string => {
   if (fragment.length === 0) return next;
   if (/\s/.test(fragment) || /\(\+?\d*$/.test(fragment)) return `${fragment} ${next}`;
@@ -239,28 +377,14 @@ const appendFragment = (fragment: string, next: string): string => {
 
 export const mergeFileLines = (prev: string, fresh: string): string => {
   const categories = ["Modified", "Created", "Read"] as const;
-  // stripped path → display string; prev inserted first, fresh display wins
   const merged: Record<string, Map<string, string>> = {};
   for (const cat of categories) merged[cat] = new Map();
 
-  // Preserved totals: a capped section's omitted entries are unparsable, so
-  // the rendered count must never shrink below the largest total seen in any
-  // header (`- Modified (26):`) or `(+N more)` tail across prev and fresh.
   const totals: Record<string, number> = {};
   const bumpTotal = (cat: string, n: number): void => {
     if (Number.isFinite(n) && n > (totals[cat] ?? 0)) totals[cat] = n;
   };
 
-  // Parse both shapes:
-  // - new: "- Modified (12):" header, one path per continuation line
-  //   (entries carry trailing commas, so a hard-wrapped path's physical
-  //   fragments reassemble into the single logical entry they came from)
-  // - legacy: "- Modified: a, b (staged), c (+N more)" comma-joined
-  // Fresh entries are recency-ordered (most recent first) and prev entries
-  // follow in stored order, so the keep-first cap below retains the most
-  // recent files instead of letting stale prev entries crowd out fresh
-  // touches. Fresh display (with current git tags) wins ties by insertion
-  // order — prev never overwrites an already-seen key.
   const headerRe = /^- (Modified|Created|Read)( \(\d+\))?:(.*)$/;
   const moreRe = /^\(\+\d+ more\)$/;
   for (const text of [fresh, prev]) {
@@ -293,8 +417,6 @@ export const mergeFileLines = (prev: string, fresh: string): string => {
       }
       if (current === null) continue;
       if (!line.startsWith(" ") && !line.startsWith("\t")) {
-        // Blank lines are wrap artifacts around a hard-broken fragment —
-        // they never terminate the category; only real content lines do.
         if (line.trim()) {
           flush();
           current = null;
@@ -340,72 +462,131 @@ export const mergeFileLines = (prev: string, fresh: string): string => {
   return `[Files And Changes]\n${lines.join("\n")}`;
 };
 
+const briefLineCount = (text: string): number => (text ? text.split("\n").length : 0);
+
+const capBriefToLineBudget = (text: string, maxLines: number): string => {
+  if (!text || maxLines <= 0) return "";
+  const lines = text.split("\n");
+  if (lines.length <= maxLines) return text;
+  const kept = lines.slice(-maxLines);
+  const firstHeader = kept.findIndex((l) => /^\[.+\]/.test(l));
+  const clean = firstHeader > 0 ? kept.slice(firstHeader) : kept;
+  const omitted = lines.length - clean.length;
+  return `...(${omitted} earlier lines omitted)\n\n${clean.join("\n")}`;
+};
+
+/** Unranked merge: prev brief + fresh brief (compile() caps the total). */
 const mergeBriefTranscript = (prev: string, fresh: string): string => {
   if (!prev) return fresh;
   if (!fresh) return prev;
   return prev + "\n\n" + fresh;
 };
 
-const mergePrevious = (prev: string, fresh: string): string => {
-  // Merge header sections
+/** Fresh brief is budget-selected; charge it against the 120-line rolling
+ * window so the merged brief cannot grow unboundedly across compactions. */
+const mergeBriefTranscriptWithFreshBudget = (prev: string, fresh: string): string => {
+  if (!prev) return fresh;
+  if (!fresh) return capBrief(prev);
+  const freshLines = briefLineCount(fresh);
+  const remainingPrevLines = Math.max(0, BRIEF_MAX_LINES - freshLines);
+  const prevTail = capBriefToLineBudget(prev, remainingPrevLines);
+  return prevTail ? `${prevTail}\n\n${fresh}` : fresh;
+};
+
+const mergePrevious = (
+  prev: string,
+  fresh: string,
+  options: { preserveFreshBrief?: boolean } = {},
+): string => {
   const headers = HEADER_NAMES.map((header) => {
-    // Files And Changes must NOT use sectionOf — it rejoins continuation lines
-    // and destroys the multi-line list format needed for correct merge parsing.
-    // Pass full summaries; mergeFileLines extracts the section itself.
-    if (header === "Files And Changes") {
-      return mergeHeaderSection(header, prev, fresh);
-    }
-    const freshSec = sectionOf(fresh, header);
-    const prevSec = sectionOf(prev, header);
-    return mergeHeaderSection(header, prevSec, freshSec);
+    const merger = SECTION_MERGERS[header];
+    if (!merger)
+      throw new Error(`summarize: no merger registered for section [${header}]`);
+    return merger(prev, fresh);
   }).filter(Boolean);
 
-  // Merge brief transcript
   const prevBrief = briefOf(prev);
   const freshBrief = briefOf(fresh);
-  const mergedBrief = mergeBriefTranscript(prevBrief, freshBrief);
+  const mergedBrief = options.preserveFreshBrief
+    ? mergeBriefTranscriptWithFreshBudget(prevBrief, freshBrief)
+    : mergeBriefTranscript(prevBrief, freshBrief);
 
   const parts: string[] = [];
   if (headers.length > 0) {
     parts.push(headers.join("\n\n"));
   }
   if (mergedBrief) {
-    parts.push(capBrief(mergedBrief));
+    parts.push(options.preserveFreshBrief ? mergedBrief : capBrief(mergedBrief));
   }
 
   return parts.join(SEPARATOR);
 };
 
-const compileFresh = (
-  input: Pick<
-    CompileInput,
-    "messages" | "fileOps" | "sourceIndices" | "touchMessages" | "cwd" | "gitTags"
-  >,
+interface CompileOptions {
+  /** Selects the brief blocks (ranked path); omitted = unranked full window. */
+  briefBlocksFor?: (blocks: ReturnType<typeof normalize>) => NormalizedBlock[];
+  capFreshBrief: boolean;
+  preserveFreshBriefOnMerge: boolean;
+}
+
+const compileWithBrief = (
+  input: CompileInput,
+  options: CompileOptions,
 ): string => {
   const blocks = filterNoise(normalize(input.messages, input.sourceIndices));
+  const briefBlocks = options.briefBlocksFor?.(blocks);
   const data = buildSections({
     blocks,
+    briefBlocks,
     messages: input.touchMessages ?? input.messages,
     fileOps: input.fileOps,
     cwd: input.cwd,
     gitTags: input.gitTags,
+    trackCommands: input.trackCommands,
+    hasEarlyRequests:
+      input.previousSummary !== undefined &&
+      pinnedEarlyRequests(input.previousSummary).length > 0,
   });
-  return formatSummary(data);
+  // The ranked brief carries its own char budget; do not also cap by lines.
+  return formatSummary(data, { capBriefTranscript: options.capFreshBrief });
 };
 
-/** Build one fresh immutable VCC segment. It never reads an older summary. */
-export const compileSegment = (
-  input: Pick<
-    CompileInput,
-    "messages" | "fileOps" | "sourceIndices" | "touchMessages" | "cwd" | "gitTags"
-  >,
-): string => {
-  const fresh = compileFresh(input);
+/** Build one fresh immutable VCC segment. It never reads an older summary.
+ * Pass `ranking` to select the brief by signal density (append mode). */
+export const compileSegment = (input: RankedCompileInput): string => {
+  const fresh = input.ranking
+    ? compileWithBrief(input, rankedOptions(input))
+    : compileWithBrief(input, unrankedOptions);
   return fresh ? wrapLongLines(fresh) : "";
 };
 
-export const compile = (input: CompileInput): string => {
-  const fresh = compileFresh(input);
+const unrankedOptions: CompileOptions = {
+  capFreshBrief: true,
+  preserveFreshBriefOnMerge: false,
+};
+
+const rankedOptions = (input: RankedCompileInput): CompileOptions => ({
+  briefBlocksFor: (blocks) =>
+    selectRankedBriefBlocks(blocks, {
+      ...input.ranking,
+      fileOps: input.ranking?.fileOps ?? input.fileOps,
+    }),
+  capFreshBrief: false,
+  preserveFreshBriefOnMerge: true,
+});
+
+/** Unranked compile: fixed rolling brief cap, upstream-legacy path. */
+export const compile = (input: CompileInput): string =>
+  compileWithPrev(input, unrankedOptions);
+
+/** Signal-density-ranked compile: the path the hook uses, with the brief
+ * budget converted from the session's calibrated charsPerToken upstream's
+ * RANKED_BRIEF_* constants (see hooks/before-compact.ts). */
+export const compileRanked = (input: RankedCompileInput): string =>
+  compileWithPrev(input, rankedOptions(input));
+
+const compileWithPrev = (input: CompileInput, options: CompileOptions): string => {
+  const fresh = compileWithBrief(input, options);
 
   // Strip OM content first (## Reflections / ## Observations + preamble),
   // then strip ALL recall notes from the previous summary using paragraph-level
@@ -414,7 +595,7 @@ export const compile = (input: CompileInput): string => {
   // stripper with fragments.
   let prev = input.previousSummary ? stripOMContent(input.previousSummary) : undefined;
   prev = prev ? stripRecallNotes(prev) : undefined;
-  const merged = prev ? mergePrevious(prev, fresh) : fresh;
+  const merged = prev ? mergePrevious(prev, fresh, { preserveFreshBrief: options.preserveFreshBriefOnMerge }) : fresh;
   if (!merged) return "";
   // Defensive: remove any recall notes that survived the above (e.g. nested
   // inside the brief transcript after a prior merge).

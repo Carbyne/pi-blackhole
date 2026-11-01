@@ -2,26 +2,34 @@
  * Section building — parses normalized blocks into structured sections.
  *
  * Upstream: https://github.com/sting8k/pi-vcc (src/core/build-sections.ts)
- * Modified by pi-blackhole:
+ * at the 0.11.0 section redesign (verbatim early requests / user messages
+ * replace the old keyword-picked Session Goal / Preferences / Outstanding
+ * Context). pi-blackhole modifications kept:
  * - Files And Changes also attributes files from raw session messages via
  *   the file-touch collector (src/extract/file-touch.ts), covering anchor-
- *   based edit tools and bash mutations that PATH_KEYS matching cannot see.
+ *   based edit tools and bash mutations that PATH_KEYS matching cannot see,
+ *   plus git working-tree tags (src/extract/git-status.ts).
+ * - [User Decisions] section from question-tool results
+ *   (src/extract/user-decisions.ts).
+ * - briefBlocks: the ranked-brief selection (core/rank.ts) feeds the brief
+ *   while the full blocks still drive the other sections.
  */
 import type { Message } from "@earendil-works/pi-ai";
 import type { FileOps, NormalizedBlock } from "../types";
-import { clipSentence, firstLine, nonEmptyLines } from "./content";
 import type { SectionData } from "../sections";
-import { extractGoals } from "../extract/goals";
+import { extractUserMessages, keepNewestUserMessages, EARLY_REQUESTS_KEPT } from "../extract/user-messages";
 import { extractFiles, formatFileList } from "../extract/files";
 import { collectFilesTouched } from "../extract/file-touch";
-import { extractPreferences, dedupPreferencesAgainstGoals } from "../extract/preferences";
-import { extractUserDecisions } from "../extract/user-decisions";
 import { extractCommits, formatCommits } from "../extract/commits";
+import { extractTrackedCommands, formatTrackedCommands } from "../extract/tracked-commands";
+import { extractUserDecisions } from "../extract/user-decisions";
 import { buildBriefSections, stringifyBrief } from "./brief";
 
 export interface BuildSectionsInput {
   blocks: NormalizedBlock[];
-  /** Raw pre-conversion session messages — enables file-touch attribution. */
+  /** Blocks selected for the brief transcript (ranked); defaults to `blocks`. */
+  briefBlocks?: NormalizedBlock[];
+  /** Raw pre-convertToLlm session messages — enables file-touch attribution. */
   messages?: Message[];
   /** Working directory for relative-path merging in file-touch attribution. */
   cwd?: string;
@@ -29,162 +37,13 @@ export interface BuildSectionsInput {
   fileOps?: FileOps;
   /** Git working-tree tags (abs path → "staged"/"new"/…), see src/extract/git-status.ts. */
   gitTags?: Map<string, string>;
+  /** Command names to record in a [Tracked Commands] section (see
+   * config trackCommands). Empty/omitted = section stays empty. */
+  trackCommands?: readonly string[];
+  /** The previous summary already holds the early requests, so this
+   * compaction's first messages are ordinary user messages. */
+  hasEarlyRequests?: boolean;
 }
-
-const BLOCKER_RE =
-  /\b(fail(ed|s|ure|ing)?|broken|cannot|can't|won't work|does not work|doesn't work|still (broken|failing|wrong)|blocked|blocker|not (fixed|resolved|working)|crash(es|ed|ing)?)\b/i;
-
-// CJK failure/blocker stems — no \b (CJK has no word boundaries). Kept to
-// unambiguous failure words; conversational hedges like 不行 and 不对 are
-// excluded to avoid chit-chat matches.
-const BLOCKER_CJK_RE = /失败|报错|错误|卡住|崩溃/;
-
-// Benign technical compounds that contain a failure stem but describe
-// mechanism, not malfunction ("add error handling" is not a blocker).
-// Stripped before the stem test, so a line only flags on a *residual* stem:
-// a line with both ("the error handling still 报错") still fires via 报错.
-const CJK_BENIGN_RE = /错误(?:处理|信息|消息|码|类型|日志|堆栈)|失败(?:重试|率)/g;
-
-// Sentence-like start: capital letter, code identifier, quote, CJK bracket —
-// or any CJK character (CJK sentences start with a han character, not ASCII
-// capitals). 【/『/「 lead bracketed CJK headings like 【报错】服务启动失败.
-const SENTENCE_START_RE = /^\s*["'`*_【『「]?[A-Z`\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
-
-const OUTSTANDING_CLIP = 200;
-
-// Bounds for path-token scanning: tool results can carry multi-megabyte
-// encoded blobs, so neither the scanned length nor the collected token set
-// may grow without bound. Real paths are short, so a head+tail window still
-// reaches a relevant path at either end of a result while the blob middle is
-// skipped; the token cap additionally bounds the error/success intersection.
-const MAX_PATH_TOKENS = 200;
-const PATH_SCAN_HEAD = 8000;
-const PATH_SCAN_TAIL = 8000;
-
-/** Path-like tokens (`src/a.ts`, `/repo/b.md`) used to match an error to its retry. */
-export const pathTokens = (text: string): Set<string> => {
-  const out = new Set<string>();
-  // Scan each token once without overlapping repetitions that backtrack on encoded blobs.
-  const scan = (chunk: string): void => {
-    for (const m of chunk.matchAll(
-      /(?<![A-Za-z0-9_.$/-])[A-Za-z0-9_.$/-]*(?<=[A-Za-z0-9_-])\.[A-Za-z0-9]{1,5}\b/g,
-    )) {
-      out.add(m[0].toLowerCase());
-      if (out.size >= MAX_PATH_TOKENS) break;
-    }
-  };
-  if (text.length <= PATH_SCAN_HEAD + PATH_SCAN_TAIL) {
-    scan(text);
-  } else {
-    scan(text.slice(0, PATH_SCAN_HEAD));
-    if (out.size < MAX_PATH_TOKENS) scan(text.slice(-PATH_SCAN_TAIL));
-  }
-  return out;
-};
-
-const extractOutstandingContext = (blocks: NormalizedBlock[]): string[] => {
-  const pending: { index: number; text: string }[] = [];
-  const seen = new Set<string>();
-  const push = (index: number, text: string) => {
-    const key = text.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    pending.push({ index, text });
-  };
-
-  // An error retried successfully later in the window is resolved, not
-  // outstanding. Bash errors extinguish only when the identical command
-  // later succeeds — a different command succeeding says nothing about the
-  // failure (e.g. tests fail, then `git status` works: the failure stands).
-  // Other tools extinguish on a later success sharing a path-like token
-  // with the error text (same file fixed); with no path tokens on either
-  // side, same-tool success is enough.
-  interface ErrorEntry {
-    name: string;
-    index: number;
-    command?: string;
-    paths: Set<string>;
-    text: string;
-  }
-  const errors: ErrorEntry[] = [];
-  const successes: { name: string; index: number; command?: string; paths: Set<string> }[] = [];
-  const lastCallCommand = new Map<string, string>();
-  blocks.forEach((b, index) => {
-    if (b.kind === "tool_call") {
-      if (b.name === "bash" && typeof b.args.command === "string") {
-        lastCallCommand.set(b.name, b.args.command);
-      }
-      return;
-    }
-    if (b.kind !== "tool_result") return;
-    if (b.isError) {
-      errors.push({
-        name: b.name,
-        index,
-        command: lastCallCommand.get(b.name),
-        paths: pathTokens(b.text),
-        text: b.text,
-      });
-    } else {
-      successes.push({
-        name: b.name,
-        index,
-        command: lastCallCommand.get(b.name),
-        paths: pathTokens(b.text),
-      });
-    }
-  });
-
-  // Other tools extinguish on a later success sharing a path-like token
-  // with the error text (same file fixed); only when neither side carries
-  // any path token is same-tool success enough — a pathless success says
-  // nothing about the file a path-bearing error mentions.
-  const isExtinguished = (e: ErrorEntry): boolean =>
-    successes.some((s) => {
-      if (s.name !== e.name || s.index <= e.index) return false;
-      if (e.name === "bash") return s.command !== undefined && s.command === e.command;
-      if (e.paths.size > 0 || s.paths.size > 0) {
-        return [...e.paths].some((p) => s.paths.has(p));
-      }
-      return true;
-    });
-  for (const e of errors) {
-    if (isExtinguished(e)) continue;
-    push(e.index, `[${e.name}] ${firstLine(e.text, OUTSTANDING_CLIP)}`);
-  }
-
-  blocks.forEach((b, index) => {
-    if (b.kind === "tool_result" && b.isError) return;
-
-    if (b.kind === "assistant" || b.kind === "user") {
-      for (const line of nonEmptyLines(b.text)) {
-        // Benign-compound strip first: mechanism discussion must not flag.
-        const scannable = line.replace(CJK_BENIGN_RE, "");
-        if (!BLOCKER_RE.test(scannable) && !BLOCKER_CJK_RE.test(scannable)) continue;
-        // CJK conveys ~2-3x the information per char — 15 is an English floor.
-        // A short failure report (失败了) is complete at 3 chars.
-        const minLength = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(line) ? 2 : 15;
-        if (line.length < minLength) continue;
-        // Skip continuation fragments (sub-bullets, parentheticals, dangling clauses)
-        if (/^\s*[-*+>]\s/.test(line)) continue;
-        if (/^\s*\(/.test(line)) continue;
-        // Require sentence-like start: capital/quote, or any CJK character
-        if (!SENTENCE_START_RE.test(line)) continue;
-        const clipped =
-          b.kind === "user"
-            ? `[user] ${clipSentence(line, OUTSTANDING_CLIP)}`
-            : clipSentence(line, OUTSTANDING_CLIP);
-        const before = seen.size;
-        push(index, clipped);
-        if (seen.size > before) break;
-      }
-    }
-  });
-
-  // Chronological (errors and prose interleaved as they occurred), keep recent.
-  pending.sort((a, z) => a.index - z.index);
-  return pending.slice(-5).map((p) => p.text);
-};
 
 const formatFileActivity = (input: BuildSectionsInput): string[] => {
   // Lazy: the touch collector only runs at compaction time, never per tool call.
@@ -214,15 +73,19 @@ const formatFileActivity = (input: BuildSectionsInput): string[] => {
 
 export const buildSections = (input: BuildSectionsInput): SectionData => {
   const { blocks } = input;
-  const briefSections = buildBriefSections(blocks);
-  const sessionGoal = extractGoals(blocks);
-  const userPreferences = dedupPreferencesAgainstGoals(extractPreferences(blocks), sessionGoal);
+  const briefSections = buildBriefSections(input.briefBlocks ?? blocks);
+  // The early requests are the session's first user messages, picked by
+  // position; they are not repeated in [User Messages].
+  const messages = extractUserMessages(blocks);
+  const early = input.hasEarlyRequests ? [] : messages.slice(0, EARLY_REQUESTS_KEPT);
   return {
-    sessionGoal,
-    outstandingContext: extractOutstandingContext(blocks),
+    earlyRequests: early,
     filesAndChanges: formatFileActivity(input),
     commits: formatCommits(extractCommits(blocks)),
-    userPreferences,
+    trackedCommands: formatTrackedCommands(
+      extractTrackedCommands(blocks, input.trackCommands ?? []),
+    ),
+    userMessages: keepNewestUserMessages(messages.slice(early.length)),
     userDecisions: extractUserDecisions(blocks),
     briefTranscript: stringifyBrief(briefSections),
   };

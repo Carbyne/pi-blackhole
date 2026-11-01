@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import type { NormalizedBlock } from "../src/types.js";
 import { extractUserDecisions, MAX_DECISIONS } from "../src/extract/user-decisions.js";
-import { compile, extractSection } from "../src/core/summarize.js";
+import { compile, sectionOf } from "../src/core/summarize.js";
 
 const result = (text: string, details?: unknown): NormalizedBlock => ({
   kind: "tool_result",
@@ -62,7 +62,7 @@ describe("decision retention across compactions", () => {
   it("keeps only the newest eight decision lines when merging two compactions", () => {
     const first = compile({ messages: Array.from({ length: MAX_DECISIONS }, (_, i) => answer(i)) });
     const merged = compile({ messages: [answer(MAX_DECISIONS)], previousSummary: first });
-    expect(extractSection(merged, "User Decisions").split("\n")).toEqual(
+    expect(sectionOf(merged, "User Decisions").split("\n").slice(1)).toEqual(
       Array.from(
         { length: MAX_DECISIONS },
         (_, i) => `- User decided: Question ${i + 1} → Choice${i + 1}`,

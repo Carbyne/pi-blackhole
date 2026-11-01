@@ -11,7 +11,13 @@ export interface FileOps {
 }
 
 export type NormalizedBlock =
-  | { kind: "user"; text: string; sourceIndex?: number }
+  | {
+      kind: "user";
+      text: string;
+      sourceIndex?: number;
+      /** Text came from an extension custom_message, not from the user. */
+      injected?: boolean;
+    }
   | { kind: "assistant"; text: string; sourceIndex?: number }
   | {
       kind: "tool_call";

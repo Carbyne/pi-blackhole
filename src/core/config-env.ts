@@ -223,6 +223,24 @@ export const DECLARATIVE_ENV_OVERRIDES: Record<string, EnvOverride> = {
         .map((s) => s.trim())
         .filter((s) => s.length > 0),
   },
+  // Comma-separated command list for the [Tracked Commands] section
+  trackCommands: {
+    var: "PI_BLACKHOLE_TRACK_COMMANDS",
+    parse: (raw: string) =>
+      raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+  },
+  // Comma-separated customType list excluded from the summary input
+  skipCustomTypes: {
+    var: "PI_BLACKHOLE_SKIP_CUSTOM_TYPES",
+    parse: (raw: string) =>
+      raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+  },
   // Enum overrides — custom parsers because canonical only auto-handles
   // booleans and positive integers.
   compaction: {

@@ -7,7 +7,25 @@ const section = (title: string, items: string[]): string => {
   return `[${title}]\n${body}`;
 };
 
-const BRIEF_MAX_LINES = 120;
+/**
+ * Join a categorized line's items (oldest first), keeping the newest `limit`
+ * behind a leading "(+N earlier)". Keeping the oldest instead froze a merged
+ * list on its first entries. stripCapMarker is its inverse, used when a merge
+ * re-reads the line. (Ported from upstream pi-vcc src/core/format.ts.)
+ */
+export const capItems = (items: readonly string[], limit: number, joinWith: string): string => {
+  if (items.length <= limit) return items.join(joinWith);
+  return `(+${items.length - limit} earlier) ` + items.slice(-limit).join(joinWith);
+};
+
+/** Files listed per Files And Changes category; the newest are kept. */
+export const FILES_PER_CATEGORY = 10;
+
+/** Also strips the trailing "(+N more)" that older versions wrote. */
+export const stripCapMarker = (text: string): string =>
+  text.replace(/^\s*\(\+\d+ earlier\)\s*/, "").replace(/\s*\(\+\d+ (?:more|earlier)\)\s*$/, "");
+
+export const BRIEF_MAX_LINES = 120;
 const TUI_SAFE_LINE_CHARS = 120;
 
 /**
@@ -53,13 +71,18 @@ export const RECALL_NOTE =
   "Details not captured here — exact code, error messages, file paths — are only recoverable via `recall`. " +
   "Use `recall` to search the session history. Do not redo work already completed.";
 
-export const formatSummary = (data: SectionData): string => {
+export interface FormatSummaryOptions {
+  capBriefTranscript?: boolean;
+}
+
+export const formatSummary = (data: SectionData, options: FormatSummaryOptions = {}): string => {
+  const capBriefTranscript = options.capBriefTranscript ?? true;
   const headerParts = [
-    section("Session Goal", data.sessionGoal),
+    section("Early Session Requests", data.earlyRequests),
     section("Files And Changes", data.filesAndChanges),
     section("Commits", data.commits),
-    section("Outstanding Context", data.outstandingContext),
-    section("User Preferences", data.userPreferences),
+    section("Tracked Commands", data.trackedCommands),
+    section("User Messages", data.userMessages),
     section("User Decisions", data.userDecisions),
   ].filter(Boolean);
 
@@ -68,7 +91,7 @@ export const formatSummary = (data: SectionData): string => {
     parts.push(headerParts.join("\n\n"));
   }
   if (data.briefTranscript) {
-    parts.push(capBrief(data.briefTranscript));
+    parts.push(capBriefTranscript ? capBrief(data.briefTranscript) : data.briefTranscript);
   }
 
   if (parts.length === 0) return "";

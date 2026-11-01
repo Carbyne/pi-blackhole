@@ -21,8 +21,12 @@ interface LocalBashMessage {
 const normalizeOne = (msg: Message, msgIndex: number | undefined): NormalizedBlock[] => {
   if (msg.role === "user") {
     const blocks: NormalizedBlock[] = [];
+    // Marked by hooks/before-compact.ts: an extension custom_message rendered
+    // as a user message — the user did not write it. Early requests and
+    // [User Messages] read only what the user wrote.
+    const injected = (msg as { injected?: boolean }).injected === true;
     const text = sanitize(textOf(msg.content));
-    if (text) blocks.push({ kind: "user", text, sourceIndex: msgIndex });
+    if (text) blocks.push({ kind: "user", text, sourceIndex: msgIndex, ...(injected ? { injected } : {}) });
     if (msg.content && typeof msg.content !== "string") {
       for (const part of msg.content) {
         if (part.type === "image") {

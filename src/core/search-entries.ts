@@ -369,6 +369,34 @@ const searchableToolCallArgs = (content: Message["content"]): string => {
   return clip(raw, TOOL_ARGS_BUDGET);
 };
 
+/** A run of base64 characters this long can be encoded data (an image, a file). Shorter
+ *  ones (keys, tokens) rarely hold a chance match: a 3-letter term hits about once per
+ *  32k random chars. JSON, code and paths break a run with punctuation.
+ *  (Ported from pi-vcc 0.11.2 — a 2 MB base64 line used to come back whole as one
+ *  recall snippet and blew the next request over the model limit, #63.) */
+const BASE64_RUN = /[A-Za-z0-9+/=]{1000,}/g;
+
+/** Encoded data mixes digits and both cases (random base64: ~16% / 40% / 40%). Joined
+ *  identifiers, hex and `=====` rules do not, and stay searchable. */
+const looksEncoded = (run: string): boolean => {
+  let digits = 0,
+    upper = 0,
+    lower = 0;
+  for (let i = 0; i < run.length; i++) {
+    const c = run.charCodeAt(i);
+    if (c >= 48 && c <= 57) digits++;
+    else if (c >= 65 && c <= 90) upper++;
+    else if (c >= 97 && c <= 122) lower++;
+  }
+  return digits >= run.length * 0.05 && upper >= run.length * 0.15 && lower >= run.length * 0.15;
+};
+
+/** Text as search sees it: encoded data is dropped, as search engines drop overlong
+ *  tokens. Terms match as substrings, so a short term would hit inside encoded runs
+ *  hundreds of times, and each run counts as one word of length. */
+const searchableText = (text: string): string =>
+  text.replace(BASE64_RUN, (run) => (looksEncoded(run) ? "…" : run));
+
 const fullText = (msg: Message, mode?: RecallMode): string => {
   if ((msg as any).role === "bashExecution") {
     if (mode === "file") return ""; // bash is not file content
@@ -555,7 +583,7 @@ export const searchEntriesDetailed = (
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     const msg = messages[i];
-    const text = msg ? fullText(msg, mode) : e.summary;
+    const text = msg ? searchableText(fullText(msg, mode)) : e.summary;
     fullTextCache.push(text);
     const filePart = e.files?.join(" ") ?? "";
     docs.push(`${e.role} ${text} ${filePart}`);

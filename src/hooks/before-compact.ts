@@ -11,7 +11,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, estimateTokens } from "@earendil-works/pi-coding-agent";
 import { writeFileSync } from "fs";
 import {
-  compile,
+  compileRanked,
   compileSegment,
   extractRecallNote,
   stripOMContent,
@@ -42,6 +42,11 @@ import { isSourceEntry } from "../om/ledger/progress.js";
 import { isToolSafeCut } from "../core/tool-safe-cut.js";
 import { observedPrefixIndex } from "../core/observation-boundary.js";
 import { selectPressureTail } from "../core/context-pressure.js";
+import {
+  calibrateCharsPerToken,
+  estimateMessageContentChars,
+  estimateTokensFromChars,
+} from "../core/token-estimate.js";
 import { estimateEntryTokens, estimateStringTokens } from "../om/tokens.js";
 
 /** Count the actual host wrapper, not only the summary's text. */
@@ -138,6 +143,111 @@ interface EntryWithMessage {
   message: { role: string; content: unknown };
 }
 
+// ── Live-window entry conversion (ported from upstream pi-vcc 0.6.0/0.8.0) ──
+
+/**
+ * Convert a non-message entry that carries LLM-context text (custom_message /
+ * branch_summary) into its agent-message form, mirroring pi-core's
+ * createCustomMessage / createBranchSummaryMessage (not root-exported, so
+ * inlined here). Without this the live window pi keeps in context contains
+ * content the summarizer never sees, and it disappears silently at every
+ * compaction.
+ */
+const toLiveMessage = (entry: any): { role: string; content: unknown; [key: string]: unknown } | null => {
+  if (entry.type === "message" && entry.message) return entry.message;
+  if (entry.type === "custom_message") {
+    return {
+      role: "custom",
+      customType: entry.customType,
+      content: entry.content,
+      display: entry.display,
+      details: entry.details,
+      timestamp: entry.timestamp != null ? new Date(entry.timestamp).getTime() : undefined,
+    };
+  }
+  if (entry.type === "branch_summary") {
+    return {
+      role: "branchSummary",
+      summary: entry.summary,
+      fromId: entry.fromId,
+      content: undefined,
+      timestamp: entry.timestamp != null ? new Date(entry.timestamp).getTime() : undefined,
+    };
+  }
+  return null;
+};
+
+/** True for entries whose text belongs to the summarizer input. */
+const isLiveTextEntry = (e: any): boolean => {
+  if (e.type === "message") return !!e.message;
+  return e.type === "custom_message" || e.type === "branch_summary";
+};
+
+const liveMessageOf = (e: any): { role: string; content: unknown } => {
+  const msg = e.type === "message" ? e.message : toLiveMessage(e);
+  if (!msg)
+    throw new Error(`before-compact: liveMessageOf called on non-live entry type ${e?.type}`);
+  return msg;
+};
+
+const toLlmSafe = (message: unknown): any[] => {
+  try {
+    return convertToLlm([message as any]);
+  } catch {
+    return [];
+  }
+};
+
+/** A custom_message the user listed in skipCustomTypes; dropped before summarizing. */
+const isSkippedCustom = (m: any, skipCustomTypes: readonly string[]): boolean =>
+  m?.role === "custom" && skipCustomTypes.includes(m?.customType);
+
+export interface LiveWindow {
+  lastCompactionIdx: number;
+  lastKeptId: string | undefined;
+  orphanRecovery: boolean;
+  liveMessages: EntryWithMessage[];
+}
+
+/**
+ * The live window: everything after the last compaction (or after the kept
+ * id; from the compaction when that id is gone — orphan recovery). Shared by
+ * buildOwnCut and the hook's token calibration so both see the same set.
+ */
+export function detectLiveWindow(branchEntries: any[]): LiveWindow {
+  let lastCompactionIdx = -1;
+  let lastKeptId: string | undefined;
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    if (branchEntries[i].type === "compaction") {
+      lastCompactionIdx = i;
+      lastKeptId = branchEntries[i].firstKeptEntryId;
+      break;
+    }
+  }
+
+  const hasPriorCompaction = lastCompactionIdx >= 0;
+  const hasValidKeptId = !!lastKeptId && branchEntries.some((e: any) => e.id === lastKeptId);
+  const orphanRecovery = hasPriorCompaction && !hasValidKeptId;
+
+  const liveMessages: EntryWithMessage[] = [];
+  if (orphanRecovery) {
+    for (let i = lastCompactionIdx + 1; i < branchEntries.length; i++) {
+      const e = branchEntries[i];
+      if (e.type === "compaction") continue;
+      if (isLiveTextEntry(e)) liveMessages.push({ entry: e, message: liveMessageOf(e) });
+    }
+  } else {
+    let foundKept = !lastKeptId; // if no prior compaction, start collecting immediately
+    for (const e of branchEntries) {
+      if (!foundKept && e.id === lastKeptId) foundKept = true;
+      if (!foundKept) continue;
+      if (e.type === "compaction") continue;
+      if (isLiveTextEntry(e)) liveMessages.push({ entry: e, message: liveMessageOf(e) });
+    }
+  }
+  return { lastCompactionIdx, lastKeptId, orphanRecovery, liveMessages };
+}
+
 export type OwnCutCancelReason = "no_live_messages" | "too_few_live_messages";
 
 export type OwnCutResult =
@@ -158,26 +268,16 @@ export function buildOwnCut(
   /** "pi-default" = use Pi's cut, "minimal" = keep only last user message (current). */
   tailBehavior?: "pi-default" | "minimal" | "unobserved",
 ): OwnCutResult {
-  // Find the last compaction entry and its firstKeptEntryId
-  let lastCompactionIdx = -1;
-  let lastKeptId: string | undefined;
-  for (let i = branchEntries.length - 1; i >= 0; i--) {
-    if (branchEntries[i].type === "compaction") {
-      lastCompactionIdx = i;
-      lastKeptId = branchEntries[i].firstKeptEntryId;
-      break;
-    }
-  }
+  const win = detectLiveWindow(branchEntries);
+  const lastKeptId = win.lastKeptId;
 
   if (tailBehavior === "unobserved") {
     // Restrict selection to the currently retained window. Older messages are
     // already represented by previousSummary even when OM coverage lags behind.
     const keptIndex = lastKeptId ? branchEntries.findIndex((entry) => entry.id === lastKeptId) : -1;
     const liveStart =
-      lastCompactionIdx < 0 ? 0 : keptIndex >= 0 ? keptIndex : lastCompactionIdx + 1;
-    const messages = branchEntries
-      .slice(liveStart)
-      .filter((entry) => entry.type === "message" && entry.message);
+      win.lastCompactionIdx < 0 ? 0 : keptIndex >= 0 ? keptIndex : win.lastCompactionIdx + 1;
+    const messages = branchEntries.slice(liveStart).filter(isLiveTextEntry);
     if (messages.length === 0) return { ok: false, reason: "no_live_messages" };
     const boundary = observedPrefixIndex(branchEntries);
     let cut = messages.findIndex((entry) => branchEntries.indexOf(entry) > boundary);
@@ -186,13 +286,13 @@ export function buildOwnCut(
     // an observed tool call must not be separated from its pending result.
     while (
       cut > 0 &&
-      (messages[cut].message.role !== "user" ||
+      (liveMessageOf(messages[cut]).role !== "user" ||
         !isToolSafeCut(branchEntries, branchEntries.indexOf(messages[cut])))
     )
       cut--;
     return {
       ok: true,
-      messages: messages.slice(0, cut).map((entry) => entry.message),
+      messages: messages.slice(0, cut).map(liveMessageOf),
       selectedIds: messages.slice(0, cut).map((entry) => entry.id),
       firstKeptEntryId:
         branchEntries.find(
@@ -206,34 +306,10 @@ export function buildOwnCut(
     };
   }
 
-  // Orphan recovery: triggers when lastKeptId is set to "" (sentinel from prior
-  // compact-all) OR set to an id that no longer exists in the branch. In both cases,
-  // start collecting from right after the last compaction entry.
-  const hasPriorCompaction = lastCompactionIdx >= 0;
-  const hasValidKeptId = !!lastKeptId && branchEntries.some((e: any) => e.id === lastKeptId);
-  const orphanRecovery = hasPriorCompaction && !hasValidKeptId;
-
-  // Collect live messages
-  const liveMessages: EntryWithMessage[] = [];
-  if (orphanRecovery) {
-    for (let i = lastCompactionIdx + 1; i < branchEntries.length; i++) {
-      const e = branchEntries[i];
-      if (e.type === "compaction") continue;
-      if (e.type === "message" && e.message) {
-        liveMessages.push({ entry: e, message: e.message });
-      }
-    }
-  } else {
-    let foundKept = !lastKeptId; // if no prior compaction, start collecting immediately
-    for (const e of branchEntries) {
-      if (!foundKept && e.id === lastKeptId) foundKept = true;
-      if (!foundKept) continue;
-      if (e.type === "compaction") continue;
-      if (e.type === "message" && e.message) {
-        liveMessages.push({ entry: e, message: e.message });
-      }
-    }
-  }
+  // Orphan recovery / live-window selection (incl. custom_message and
+  // branch_summary entries, see detectLiveWindow) is shared with the hook's
+  // token calibration so both see the identical set.
+  const liveMessages = win.liveMessages;
 
   // Minimal normally cuts at the last user message. If Pi found a later safe
   // split-turn boundary, use it too so one oversized current turn is not kept whole.
@@ -462,28 +538,11 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
       const lastComp = [...branchEntries].reverse().find((e: any) => e.type === "compaction");
       const lastCompIdx = lastComp ? (branchEntries as any[]).indexOf(lastComp) : -1;
 
-      // Recompute liveMessages view (same logic as buildOwnCut) for diagnostic
-      const lastKeptId: string | undefined = (lastComp as any)?.firstKeptEntryId;
-      const hasPriorCompaction = lastCompIdx >= 0;
-      const hasValidKeptId =
-        !!lastKeptId && (branchEntries as any[]).some((e: any) => e.id === lastKeptId);
-      const diagOrphan = hasPriorCompaction && !hasValidKeptId;
-      const liveRoles: string[] = [];
-      if (diagOrphan) {
-        for (let i = lastCompIdx + 1; i < branchEntries.length; i++) {
-          const e = (branchEntries as any[])[i];
-          if (e.type === "compaction") continue;
-          if (e.type === "message" && e.message) liveRoles.push(e.message.role);
-        }
-      } else {
-        let foundKept = !lastKeptId;
-        for (const e of branchEntries as any[]) {
-          if (!foundKept && e.id === lastKeptId) foundKept = true;
-          if (!foundKept) continue;
-          if (e.type === "compaction") continue;
-          if (e.type === "message" && e.message) liveRoles.push(e.message.role);
-        }
-      }
+      // Recompute the liveMessages view (the same shared path buildOwnCut
+      // takes, via detectLiveWindow) for diagnostics.
+      const liveRoles = detectLiveWindow(branchEntries as any[]).liveMessages.map(
+        (lm) => lm.message.role,
+      );
       const userIndices = liveRoles.reduce<number[]>(
         (acc, r, i) => (r === "user" ? (acc.push(i), acc) : acc),
         [],
@@ -535,6 +594,33 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
       return { cancel: true };
     }
 
+    // Token calibration (ported from upstream pi-vcc 0.4.0): derive
+    // chars/token from the harness-reported tokensBefore over the whole live
+    // window (independent of the tail, mirroring upstream's keep-0
+    // calibration cut), so the ranked brief's token budget tracks real
+    // content density (CJK, minified blobs) instead of the chars/4 heuristic.
+    const calibrationMessageChars = detectLiveWindow(branchEntries as any[]).liveMessages.reduce(
+      (sum: number, lm) => sum + estimateMessageContentChars(lm.message?.content),
+      0,
+    );
+    const calibrationSummaryChars =
+      typeof preparation.previousSummary === "string" ? preparation.previousSummary.length : 0;
+    const tokenEstimate = calibrateCharsPerToken(
+      calibrationMessageChars + calibrationSummaryChars,
+      preparation.tokensBefore,
+    );
+    // Ranked compaction budgets (upstream constants): keep the highest-signal
+    // blocks under a size-relative token budget converted to chars via the
+    // calibrated ratio. Floor/ceiling/per-block, as upstream's audit set them.
+    const RANKED_BRIEF_BUDGET_TOKENS = 1100;
+    const RANKED_BRIEF_CEILING_TOKENS = 2000;
+    const RANKED_BRIEF_TOKENS_PER_BLOCK = 15;
+    const rankedBriefBudget = {
+      maxBriefChars: Math.round(RANKED_BRIEF_BUDGET_TOKENS * tokenEstimate.charsPerToken),
+      maxBriefCharsCeiling: Math.round(RANKED_BRIEF_CEILING_TOKENS * tokenEstimate.charsPerToken),
+      briefCharsPerBlock: Math.round(RANKED_BRIEF_TOKENS_PER_BLOCK * tokenEstimate.charsPerToken),
+    };
+
     const pressureEnabled = omRuntime.config.contextPressureFallback === "vcc";
     let pressureBridged = false;
     if (pressureEnabled) {
@@ -569,9 +655,11 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
           const messages = sources.flatMap((entry) =>
             entry.type === "message" ? convertToLlm([entry.message]) : [],
           );
-          const summary = compile({
+          const summary = compileRanked({
             messages,
             previousSummary: preparation.previousSummary,
+            trackCommands: omRuntime.config.trackCommands,
+            ranking: rankedBriefBudget,
             fileOps: {
               readFiles: [...preparation.fileOps.read],
               modifiedFiles: [...preparation.fileOps.written, ...preparation.fileOps.edited],
@@ -659,16 +747,18 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
     }
     const convertedWithIndices: Array<{ message: any; sourceIndex: number | undefined }> = [];
     for (let i = 0; i < agentMessages.length; i++) {
-      let converted: any[];
-      try {
-        converted = convertToLlm([agentMessages[i]]);
-      } catch {
-        continue;
-      }
+      const converted = toLlmSafe(agentMessages[i]);
       if (converted.length === 0) continue;
+      // Ported from pi-vcc 0.8.0/0.11.0: custom_messages listed in
+      // skipCustomTypes are dropped from the summary input; any other
+      // custom_message is marked `injected` so [Early Session Requests] and
+      // [User Messages] read only what the user wrote. bashExecution entries
+      // pass through as-is: the brief renders them as one `$ cmd (#N)` line.
+      const src = agentMessages[i] as unknown as { role?: string; customType?: string };
+      if (isSkippedCustom(src, omRuntime.config.skipCustomTypes)) continue;
       const id = agentSelectedIds[i];
       convertedWithIndices.push({
-        message: converted[0],
+        message: src?.role === "custom" ? { ...converted[0], injected: true } : converted[0],
         sourceIndex: typeof id === "string" ? globalIndexById?.get(id) : undefined,
       });
     }
@@ -684,36 +774,16 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
     const keptIdx = (branchEntries as any[]).findIndex((e: any) => e.id === firstKeptEntryId);
     const keptEntries =
       keptIdx >= 0
-        ? (branchEntries as any[]).slice(keptIdx).filter((e: any) => e.type === "message")
+        ? (branchEntries as any[]).slice(keptIdx).filter(isLiveTextEntry)
         : [];
-    const keptChars = keptEntries.reduce((sum: number, e: any) => {
-      const c = e.message?.content;
-      if (typeof c === "string") return sum + c.length;
-      if (Array.isArray(c))
-        return (
-          sum +
-          c.reduce((s: number, p: any) => {
-            if (p.text) return s + p.text.length;
-            if (p.type === "toolCall")
-              return (
-                s +
-                (p.name?.length ?? 0) +
-                (typeof p.input === "string"
-                  ? p.input.length
-                  : JSON.stringify(p.input ?? "").length)
-              );
-            if (p.type === "toolResult")
-              return (
-                s +
-                (typeof p.content === "string"
-                  ? p.content.length
-                  : JSON.stringify(p.content ?? "").length)
-              );
-            return s;
-          }, 0)
-        );
-      return sum;
-    }, 0);
+    // Upstream's calibrated content-char counter: counts text, thinking,
+    // toolCall arguments and images, so keptTokensEst reflects what the model
+    // actually receives (the old ad-hoc reducer missed thinking and counted
+    // `input` instead of `arguments`).
+    const keptChars = keptEntries.reduce(
+      (sum: number, e: any) => sum + estimateMessageContentChars(liveMessageOf(e)?.content),
+      0,
+    );
     const totalUserTurns = (branchEntries as any[]).filter(
       (e: any) => e.type === "message" && e.message?.role === "user",
     ).length;
@@ -725,7 +795,7 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
     omRuntime.compactionStats = {
       summarized: agentMessages.length,
       kept: keptEntries.length,
-      keptTokensEst: Math.round(keptChars / 4),
+      keptTokensEst: estimateTokensFromChars(keptChars, tokenEstimate.charsPerToken),
       compactAll: ownCut.compactAll,
       totalUserTurns,
       keptUserTurns,
@@ -743,9 +813,11 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
     // Git working-tree tags for fresh-window annotations; empty (no
     // annotations) outside a repo or if git fails.
     const gitTags = loadGitFileTags(ctx.cwd ?? process.cwd());
-    const summary = compile({
+    const summary = compileRanked({
       messages,
       previousSummary: preparation.previousSummary,
+      trackCommands: omRuntime.config.trackCommands,
+      ranking: rankedBriefBudget,
       fileOps,
       sourceIndices,
       touchMessages: agentMessages,
@@ -756,6 +828,8 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, omRuntime: Runtime) 
       omRuntime.config.compactionSummaryMode === "append"
         ? compileSegment({
             messages,
+            trackCommands: omRuntime.config.trackCommands,
+            ranking: rankedBriefBudget,
             fileOps,
             sourceIndices,
             touchMessages: agentMessages,

@@ -30,6 +30,6 @@ export const collapseSkillLines = (lines: string[]): string[] => {
 };
 
 /** Collapse <skill name="X" ...>...</skill> blocks in raw text */
-const SKILL_BLOCK_RE = /<skill\s+name="([^"]+)"[^>]*>[\s\S]*?(?:<\/skill>|$)/g;
+export const SKILL_BLOCK_RE = /<skill\s+name="([^"]+)"[^>]*>[\s\S]*?(?:<\/skill>|$)/g;
 export const collapseSkillText = (text: string): string =>
   text.replace(SKILL_BLOCK_RE, (_, name) => `[skill: ${name}]`);

@@ -119,6 +119,19 @@ export interface UnifiedConfig {
    */
   skipForProviders: string[];
 
+  /** Command names to remember across compactions in a [Tracked Commands]
+   *  section (ported from pi-vcc 0.9.0). Any command or prefix works:
+   *  ["ssh", "kubectl", "docker"], ["psql", "./deploy.sh"], or "gh pr"
+   *  (matches `gh pr merge`, not `gh run`). Only `bash` tool calls are read;
+   *  the 10 most recent invocations per command are kept. Empty = off. */
+  trackCommands: string[];
+
+  /** `customType` values of `custom_message` entries to leave out of the
+   *  summary input (ported from pi-vcc 0.8.0) — per-turn boilerplate other
+   *  extensions inject (skill cards, guidance blocks). Exact, case-sensitive
+   *  match. Only the summary input changes; the cut is untouched. */
+  skipCustomTypes: string[];
+
   /** Mid-run auto-compaction (turn_end trigger, fires while the agent is still
    *  executing tool loops — agent_end alone never fires during long runs).
    *  "resume" — compact transparently at the turn boundary; the same run continues (opt-in)
@@ -310,6 +323,8 @@ export const DEFAULTS: UnifiedConfig = {
   compactionSummaryMode: "default",
 
   skipForProviders: [],
+  trackCommands: [],
+  skipCustomTypes: [],
   tailBehavior: "minimal",
   contextPressureFallback: "off",
   showPreCompactionMessage: true,
@@ -628,6 +643,17 @@ function parseConfig(raw: Record<string, unknown>): Partial<UnifiedConfig> {
       .map((v) => v.trim())
       .filter((v) => v.length > 0);
     if (list.length > 0) c.skipForProviders = list;
+  }
+
+  // String list knobs ported from pi-vcc (pi-vcc-config.json names accepted too)
+  for (const key of ["trackCommands", "skipCustomTypes"] as const) {
+    const source = Array.isArray(raw[key]) ? raw[key] : undefined;
+    if (!source) continue;
+    const list = source
+      .filter((v): v is string => typeof v === "string")
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0);
+    c[key] = list;
   }
 
   // Booleans — pi-vcc
