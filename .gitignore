@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# dist/ is committed so pi git-installs work without a build step (pi always runs --omit=dev)
 
 *.debug.json
 *.ndjson
